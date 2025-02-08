@@ -5,9 +5,9 @@ from torch.nn import functional as F
 # hyperparameters
 batch_size = 32
 block_size = 8
-max_iters = 3000
+max_iters = 5000
 eval_interval = 300  # check loss every 300 iters
-learning_rate = 1e-2
+learning_rate = 1e-3
 device = "cuda" if torch.cuda.is_available() else "cpu"
 eval_iters = 200
 n_embd = 32 # embedding dimension
@@ -70,6 +70,32 @@ def estimate_loss():
     model.train()
     return out
 
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)   # (B, T, 16)
+        q = self.query(x) # (B, T, 16)
+        # we want to matrix multiply q @ k, but we have to fix the dims
+        # remember that matrix multiplication is over the last 2 dims in each tensor
+        # let's transpose key to be (B, 16, T)
+        wei = q @ k.transpose(-2, -1) * C**-0.5 # (B, T, 16) @ (B, 16, T) --> (B, T, T)
+        # wei is now the "affinities"; for each batch it has a (T, T) tensor
+        # it will now produce different outputs since we are using the actual token values
+
+        # nodes from the future can't talk to nodes in their past
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=1)
+
+        v = self.value(x)
+        out = wei @ v
+        return out
 
 # simple bigram model
 class BigramLanguageModel(nn.Module):
@@ -78,6 +104,7 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.sa_head = Head(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -86,6 +113,7 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx)  # (B, T, C), C = n_embd
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T, C)
         x = tok_emb + pos_emb  # (B, T, C)
+        x = self.sa_head(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
         if targets is None:
@@ -101,8 +129,10 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         # idx is (B, T)
         for _ in range(max_new_tokens):
+            # crop idx to the last block_size tokens
+            idx_cond = idx[:, -block_size:]
             # get predictions
-            logits, loss = self(idx)
+            logits, loss = self(idx_cond)
             # get all the last elements
             logits = logits[:, -1, :]
             # convert to probs
